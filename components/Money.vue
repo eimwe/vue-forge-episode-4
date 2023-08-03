@@ -10,6 +10,8 @@ type MoneyProps = {
 const props = withDefaults(defineProps<MoneyProps>(), {
   sign: "$KDA",
   currency: "other",
+  sign: "$KDA",
+  currency: "other",
 });
 
 const localeOptions = computed(() => {

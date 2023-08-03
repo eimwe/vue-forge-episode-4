@@ -1,6 +1,4 @@
 import {
-  createWalletConnectQuicksign,
-  getClient,
   ICommandResult,
   IPactCommand,
   isSignedCommand,
@@ -11,17 +9,10 @@ import {
 import { ExtractType } from "@kadena/client/lib/commandBuilder/commandBuilder";
 import { ICapabilityItem } from "@kadena/client/lib/interfaces/IPactCommand";
 import { PactNumber } from "@kadena/pactjs";
-import Client from "@walletconnect/sign-client";
-import SignClient from "@walletconnect/sign-client";
-import { SessionTypes } from "@walletconnect/types";
-import { nanoid } from "nanoid";
 import { RemovableRef, useStorage } from "@vueuse/core";
 
-const kadenaClient = getClient(
-  ({ chainId }) =>
-    `http://127.0.0.1:8080/chainweb/0.0/fast-development/chain/${chainId}/pact`
-);
-const { chain, networkId, isConnected, publicKey } = useWallet();
+const kadenaClient = useGetClient();
+const { publicKey } = useWallet();
 export const usePact = async () => {
   const { signTransaction, connect, networkId, chain } = useWallet();
   const pendingRequestsKeys: RemovableRef<
@@ -42,8 +33,13 @@ export const usePact = async () => {
   type TFund = {
     projectId: string;
     funder: string;
-    amount: number;
+    amount: string;
   };
+
+  type TCancel = {
+    projectId: string;
+  };
+
   type TProject = {
     id: string;
     name: string;
@@ -93,6 +89,10 @@ export const usePact = async () => {
     );
   };
 
+  const createCancelObject = ({ projectId }: TCancel) => {
+    return Pact.modules["free.crowdfund"]["cancel-project"](projectId);
+  };
+
   const _getOptions = (
     options?: TTransactionOptions | TSignTransactionOptions
   ) => {
@@ -102,12 +102,14 @@ export const usePact = async () => {
     };
   };
 
-  const createTransaction = (
-    executionObject: any,
+  const createTransaction = <TCode extends string & { capability: any }>(
+    executionObject: TCode,
     keyset: string,
     sender: Sender,
     options?: TTransactionOptions,
-    capabilities?: (withCapability: ExtractType<TCommand>) => ICapabilityItem[]
+    capabilities?: (
+      withCapability: ExtractType<{ payload: { funs: [TCode] } }>
+    ) => ICapabilityItem[]
   ) => {
     const { chain: chainId, networkId } = _getOptions(options);
 
@@ -116,7 +118,7 @@ export const usePact = async () => {
       .addKeyset(keyset, "keys-all", sender.publicKey)
       .setNetworkId(networkId) //fast-development - https://github.com/kadena-community/crowdfund
       .setMeta({ chainId, sender: sender.account })
-      .addSigner(sender.publicKey, capabilities)
+      .addSigner(sender.publicKey, capabilities as any)
       .createTransaction();
   };
 
@@ -182,8 +184,8 @@ export const usePact = async () => {
           startsAt: new Date(form.startsAt),
           finishesAt: new Date(form.finishesAt),
         },
-        hardCap: form.hardCap,
-        softCap: form.softCap,
+        hardCap: Number(form.hardCap),
+        softCap: Number(form.softCap),
         keyset,
       });
       const transaction = createTransaction(cmd, keyset, sender);
@@ -193,6 +195,47 @@ export const usePact = async () => {
         const url = ""; // this will be the local url for devnet and should pass in below
         const requestKey = await submitCommand(signedCommand);
         saveToRequestKeyLocalStorage(requestKey, "create");
+        pollPendingRequests().then(() => null);
+        return { requestKey };
+      }
+    } catch (err) {
+      console.log(err);
+      // alert there was an error submitting to blockchain
+    }
+
+    return { requestKey: null };
+  };
+
+  const cancel = async (
+    projectId: string
+  ): Promise<{ requestKey: string | null }> => {
+    await connect();
+    try {
+      if (!publicKey.value)
+        throw new Error("Public key required to build transaction");
+
+      const sender = createSenderObject(publicKey.value);
+      // this is from the wallet
+      const keyset = "ks";
+      const cmd = createCancelObject({ projectId });
+
+      const transaction = createTransaction(
+        cmd,
+        keyset,
+        sender,
+        {},
+        (withCapability) => [
+          withCapability("coin.GAS"),
+          withCapability("free.crowdfund.PROJECT_OWNER", projectId),
+          withCapability("free.crowdfund.CANCEL", projectId),
+        ]
+      );
+      const signedCommand = await signTransaction(transaction);
+
+      if (isSignedCommand(signedCommand)) {
+        const url = ""; // this will be the local url for devnet and should pass in below
+        const requestKey = await submitCommand(signedCommand);
+        saveToRequestKeyLocalStorage(requestKey, "cancel");
         pollPendingRequests().then(() => null);
         return { requestKey };
       }
@@ -220,6 +263,11 @@ export const usePact = async () => {
         funder: sender.account,
         amount: form.amount,
       });
+
+      const {
+        result: { data: projectAccount },
+      } = await getProjectAccount(form.id);
+
       const transaction = createTransaction(
         cmd,
         keyset,
@@ -227,9 +275,16 @@ export const usePact = async () => {
         {},
         (withCapability) => [
           withCapability("coin.GAS"),
-          withCapability("coin.TRANSFER"),
+          withCapability(
+            "coin.TRANSFER",
+            sender.account,
+            projectAccount,
+            new PactNumber(form.amount).toPactDecimal()
+          ),
+          withCapability("free.crowdfund.ACCT_GUARD", sender.account, form.id),
         ]
       );
+      console.log(transaction);
       const signedCommand = await signTransaction(transaction);
 
       if (isSignedCommand(signedCommand)) {
@@ -249,7 +304,7 @@ export const usePact = async () => {
 
   const saveToRequestKeyLocalStorage = (
     requestKey: string,
-    type: "create" | "fund"
+    type: "create" | "fund" | "cancel" | "fail" | "success"
   ) => {
     const currentRequestKeys: Record<
       string,
@@ -259,30 +314,59 @@ export const usePact = async () => {
     pendingRequestsKeys.value = currentRequestKeys;
   };
 
-  const updatePendingRequestStatus = (
+  const updatePendingRequestStatus = async (
     pendingRequest: ICommandResult,
     pending: { requestKey: string; type: string }
   ) => {
     const { updateStatusForRequestKey } = useProjects();
-    // 	// update project status on DB with response from blockchain
-    if (pendingRequest.result.status === "success") {
-      let data = {};
-      // If the pending request is a create project
-      if (pending.type === "create") {
+    // If the pending request is a fund project
+    if (pending.type === "fund") {
+      delete pendingRequestsKeys.value[pending.requestKey];
+      if (pendingRequest.result.status === "failure") {
+        useAlerts().error(
+          pendingRequest.result?.error?.message ||
+            "There was an error funding the project",
+          {
+            title: "There was an error funding the project",
+            dismissiable: false,
+          }
+        );
+      }
+
+      if (pendingRequest.result.status === "success") {
+        useAlerts().success("Project funded successfully");
+      }
+
+      delete pendingRequestsKeys.value[pending.requestKey];
+    }
+
+    if (pending.type === "create") {
+      // 	// update project status on DB with response from blockchain
+      if (pendingRequest.result.status === "success") {
+        let data = {};
+        // If the pending request is a create project
         data = { status: "created" };
+        useAlerts().success("Project created successfully on the blockchain");
+        await updateStatusForRequestKey(pendingRequest.reqKey, data).then(
+          () => {
+            // data has been stored in the blockchain
+            // we can connect it with the data in the database
+            // remove from pending requests
+            delete pendingRequestsKeys.value[pending.requestKey];
+          }
+        );
       }
-      // If the pending request is a fund project
-      if (pending.type === "fund") {
-        // Add +1 Backer
-        data = { backers: 1 };
+
+      if (pendingRequest.result.status === "failure") {
+        useAlerts().error(
+          pendingRequest.result?.error?.message ||
+            "There was an error creating the project on the blockchain",
+          { title: "There was an error creating the project" }
+        );
+        await updateStatusForRequestKey(pendingRequest.reqKey, {
+          status: "failed",
+        });
       }
-      const response = updateStatusForRequestKey(pendingRequest.reqKey, data);
-      console.log("success", response);
-      // data has been stored in the blockchain
-      // we can connect it with the data in the database
-      // remove from pending requests
-    } else {
-      // there was an error alert
     }
   };
 
@@ -304,7 +388,18 @@ export const usePact = async () => {
       })
       .createTransaction();
     const response = await kadenaClient.dirtyRead(transaction);
-    console.log("response", response);
+    return response;
+  };
+
+  const getProjectAccount = async (uuid: string) => {
+    const transaction = Pact.builder
+      .execution(Pact.modules["free.crowdfund"]["vault-account"](uuid))
+      .setNetworkId(networkId.value) //fast-development - https://github.com/kadena-community/crowdfund
+      .setMeta({
+        chainId: chain.value, // instruct everyone to use chain 0 on devnet
+      })
+      .createTransaction();
+    const response = await kadenaClient.dirtyRead(transaction);
 
     return response;
   };
@@ -312,8 +407,10 @@ export const usePact = async () => {
   return {
     create,
     fund,
+    cancel,
     pollPendingRequests,
     getProjectStatus,
+    getProjectAccount,
     listen,
   };
 };
