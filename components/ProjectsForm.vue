@@ -128,6 +128,8 @@ watchDebounced([startsAt, finishesAt], validateFinishDateIsAfterStartDate, {
   maxWait: 1000,
 });
 
+// You can use these abstractions to save data to supabase and/or the blockchain
+// definitely try to do one of your choice manually though! It's a great learning experience
 const softCap = computed(() => form.softCap);
 const hardCap = computed(() => form.hardCap);
 const { asKda: softCapAsKda } = useKdaUsd(form.softCap, "usd");
@@ -146,6 +148,30 @@ const submitForm = async () => {
   // request key again.
 
   const startsAt = getExactStartTimeFromDateField(form.startsAt);
+
+  const { requestKey } = await createOnBlockchain({
+    id: form.projectId,
+    name: form.title,
+    startsAt: startsAt, // form.startsAt,
+    finishesAt: form.finishesAt,
+    softCap: form.softCap.toString(),
+    hardCap: form.hardCap.toString(),
+  });
+
+  if (requestKey) {
+    const newForm = await createProjectInDB({
+      ...form,
+      hardCap: form.hardCap.toString(),
+      softCap: form.softCap.toString(),
+      excerpt: `${form.description.substring(0, 130)} ...`,
+      image: form.image || "https://placehold.co/500x320",
+      requestKey,
+    });
+
+    useAlerts().success("Project created");
+    navigateTo(`/projects/${newForm.uuid}`);
+  } else {
+    useAlerts().error("There was an error creating your project!");
   if (!softCapAsKda.value || !hardCapAsKda.value) {
     throw createError(
       "There was an error converting the soft and hard caps to KDA"
